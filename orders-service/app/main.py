@@ -1,198 +1,171 @@
 import logging
 import os
+from typing import List
 
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
+from fastapi.security import OAuth2PasswordRequestForm
 import httpx
-from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
-from . import crud, schemas
+from . import models, schemas
+from .auth import create_access_token, get_current_user, hash_password, verify_password
 from .database import Base, engine, get_db
 
-load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("orders_api")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-
-logger = logging.getLogger("orders-api")
-
-FORECAST_URL = os.getenv(
-    "FORECAST_URL",
-    "http://forecast-api:8001",
-)
-
-FORECAST_TIMEOUT = float(
-    os.getenv("FORECAST_TIMEOUT", "3.0")
-)
-
-# Tables are created automatically for the initial version.
-# In production, replace this with Alembic migrations.
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(
-    title="Orders API",
-    version="0.1.0",
-)
+app = FastAPI(title="Orders API")
+
+FORECAST_URL = os.getenv("FORECAST_URL", "http://forecast-api:8001/predict")
+FORECAST_TIMEOUT = float(os.getenv("FORECAST_TIMEOUT", "3.0"))
+
+FEATURE_FIELDS = {
+    "gr_liv_area",
+    "total_bsmt_sf",
+    "garage_area",
+    "year_built",
+    "overall_qual",
+    "ms_zoning",
+}
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=0.3, max=2),
-    retry=retry_if_exception_type(
-        (httpx.ConnectError, httpx.TimeoutException)
-    ),
-    reraise=True,
-)
-def _request_prediction(payload: dict) -> float:
-    """Request a price prediction from the forecasting service.
-
-    Retry only transient network failures such as connection errors
-    and timeouts. HTTP errors are not retried.
-    """
-    response = httpx.post(
-        f"{FORECAST_URL}/predict",
-        json=payload,
-        timeout=FORECAST_TIMEOUT,
-    )
-    response.raise_for_status()
-
-    return float(response.json()["predicted_price"])
-
+def fetch_predicted_price(payload: dict) -> float | None:
+    try:
+        with httpx.Client(timeout=FORECAST_TIMEOUT) as client:
+            resp = client.post(FORECAST_URL, json=payload)
+            resp.raise_for_status()
+            return float(resp.json()["predicted_price"])
+    except Exception as exc:
+        logger.warning(f"Forecast API unavailable, graceful degradation to None: {exc}")
+        return None
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    """Return the health status of the Orders API."""
+def health():
     return {"status": "ok"}
 
 
-@app.post(
-    "/orders",
-    response_model=schemas.OrderRead,
-    status_code=201,
-)
+@app.post("/auth/register", response_model=schemas.UserOut, status_code=status.HTTP_201_CREATED)
+def register(payload: schemas.UserCreate, db: Session = Depends(get_db)):
+    existing = db.query(models.User).filter(models.User.username == payload.username).first()
+    if existing:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already registered")
+    user = models.User(
+        username=payload.username,
+        hashed_password=hash_password(payload.password),
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.post("/auth/login", response_model=schemas.Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {"access_token": create_access_token(subject=user.username), "token_type": "bearer"}
+
+
+@app.get("/auth/me", response_model=schemas.UserOut)
+def read_me(current_user: models.User = Depends(get_current_user)):
+    return current_user
+
+
+@app.post("/orders", response_model=schemas.OrderRead, status_code=status.HTTP_201_CREATED)
 def create_order(
-    data: schemas.OrderCreate,
+    payload: schemas.OrderCreate,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
 ):
-    """Create an order and attempt to obtain a price prediction.
-
-    If the forecasting service is unavailable, the order is still
-    persisted with a null predicted price.
-    """
-    try:
-        price = _request_prediction(data.model_dump())
-    except Exception as exc:
-        logger.error(
-            "Forecast service is unavailable: %s",
-            exc,
-        )
-        price = None
-
-    return crud.create_order(
-        db,
-        data,
-        price,
-    )
-
-
-@app.get(
-    "/orders",
-    response_model=list[schemas.OrderRead],
-)
-def list_orders(
-    limit: int = 20,
-    offset: int = 0,
-    db: Session = Depends(get_db),
-):
-    """Return a paginated list of orders."""
-    if limit < 1 or limit > 100:
-        raise HTTPException(
-            status_code=400,
-            detail="Limit must be between 1 and 100.",
-        )
-
-    if offset < 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Offset must be non-negative.",
-        )
-
-    return crud.list_orders(
-        db,
-        limit,
-        offset,
-    )
-
-
-@app.get(
-    "/orders/{oid}",
-    response_model=schemas.OrderRead,
-)
-def get_order(
-    oid: int,
-    db: Session = Depends(get_db),
-):
-    """Return a single order by ID."""
-    order = crud.get_order(db, oid)
-
-    if order is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Order not found.",
-        )
-
+    forecast_payload = {
+        "gr_liv_area": payload.gr_liv_area,
+        "total_bsmt_sf": payload.total_bsmt_sf,
+        "garage_area": payload.garage_area,
+        "year_built": payload.year_built,
+        "overall_qual": payload.overall_qual,
+        "ms_zoning": payload.ms_zoning,
+    }
+    predicted_price = fetch_predicted_price(forecast_payload)
+    order = models.Order(**payload.model_dump(), predicted_price=predicted_price)
+    db.add(order)
+    db.commit()
+    db.refresh(order)
     return order
 
 
-@app.patch(
-    "/orders/{oid}",
-    response_model=schemas.OrderRead,
-)
+@app.get("/orders", response_model=List[schemas.OrderRead])
+def list_orders(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    return db.query(models.Order).order_by(models.Order.id).offset(offset).limit(limit).all()
+
+
+@app.get("/orders/{oid}", response_model=schemas.OrderRead)
+def get_order(
+    oid: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    order = db.query(models.Order).filter(models.Order.id == oid).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return order
+
+
+@app.patch("/orders/{oid}", response_model=schemas.OrderRead)
 def update_order(
     oid: int,
-    data: schemas.OrderUpdate,
+    payload: schemas.OrderUpdate,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
 ):
-    """Update an existing order."""
-    order = crud.get_order(db, oid)
+    order = db.query(models.Order).filter(models.Order.id == oid).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
 
-    if order is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Order not found.",
-        )
+    update_data = payload.model_dump(exclude_unset=True)
+    features_changed = bool(FEATURE_FIELDS.intersection(update_data.keys()))
 
-    return crud.update_order(
-        db,
-        order,
-        data,
-    )
+    for field, value in update_data.items():
+        setattr(order, field, value)
+
+    if features_changed:
+        forecast_payload = {
+            "gr_liv_area": order.gr_liv_area,
+            "total_bsmt_sf": order.total_bsmt_sf,
+            "garage_area": order.garage_area,
+            "year_built": order.year_built,
+            "overall_qual": order.overall_qual,
+            "ms_zoning": order.ms_zoning,
+        }
+        order.predicted_price = fetch_predicted_price(forecast_payload)
+
+    db.commit()
+    db.refresh(order)
+    return order
 
 
-@app.delete(
-    "/orders/{oid}",
-    status_code=204,
-)
+@app.delete("/orders/{oid}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_order(
     oid: int,
     db: Session = Depends(get_db),
-) -> None:
-    """Delete an existing order."""
-    order = crud.get_order(db, oid)
-
-    if order is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Order not found.",
-        )
-
-    crud.delete_order(db, order)
+    current_user: models.User = Depends(get_current_user),
+):
+    order = db.query(models.Order).filter(models.Order.id == oid).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    db.delete(order)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
