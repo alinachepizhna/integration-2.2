@@ -1,18 +1,11 @@
 from datetime import datetime
-from typing import Optional
-from pydantic import BaseModel, Field, field_validator
+from typing import List, Literal, Optional
+from pydantic import BaseModel, Field
 
 
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=64)
     password: str = Field(..., min_length=8, max_length=72)
-
-    @field_validator("password")
-    @classmethod
-    def validate_password_bytes(cls, v: str) -> str:
-        if not (8 <= len(v.encode("utf-8")) <= 72):
-            raise ValueError("Password must be between 8 and 72 bytes")
-        return v
 
 
 class UserOut(BaseModel):
@@ -20,7 +13,6 @@ class UserOut(BaseModel):
     username: str
     is_active: bool
     created_at: datetime
-
     model_config = {"from_attributes": True}
 
 
@@ -59,6 +51,21 @@ class OrderRead(BaseModel):
     overall_qual: int
     ms_zoning: str
     predicted_price: Optional[float] = None
+    status: str
+    model_version: Optional[str] = None
     created_at: Optional[datetime] = None
-
     model_config = {"from_attributes": True}
+
+
+class BatchOrderItemResult(BaseModel):
+    index: int
+    order_id: int
+    status: Literal["priced", "failed"]
+    predicted_price: Optional[float] = None
+    model_version: Optional[str] = None
+    error: Optional[str] = None
+
+
+class BatchOrderResponse(BaseModel):
+    total: int
+    results: List[BatchOrderItemResult]

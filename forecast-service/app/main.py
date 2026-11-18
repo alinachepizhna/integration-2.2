@@ -1,97 +1,75 @@
-"""Entry point for the forecasting service (forecast-api)."""
+from contextlib import asynccontextmanager
+import json
 import logging
 import os
-import time
-from contextlib import asynccontextmanager
 from pathlib import Path
+import time
 
-import joblib
+from fastapi import FastAPI, Request
+import mlflow
+import mlflow.pyfunc
+from mlflow.tracking import MlflowClient
 import pandas as pd
-from dotenv import load_dotenv
-from fastapi import FastAPI
 
-from .model import CAT, NUM, train_model
-from .schemas import PredictRequest, PredictResponse
+from . import schemas
 
-# Used for local runs outside Docker. In the container, orchestrator
-# environment variables are already present, and load_dotenv() does not
-# override existing environment variables.
-load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("forecast_api")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-logger = logging.getLogger("forecast-api")
+MODEL_NAME = os.getenv("MODEL_NAME", "house-price")
+MODEL_ALIAS = os.getenv("MODEL_ALIAS", "prod")
 
-MODEL_PATH = Path(os.getenv("MODEL_PATH", "/app/artifacts/model.pkl"))
-MODEL_VERSION = os.getenv("MODEL_VERSION", "v0.1.0")
+COLUMN_MAP = {
+    "gr_liv_area": "GrLivArea",
+    "total_bsmt_sf": "TotalBsmtSF",
+    "garage_area": "GarageArea",
+    "year_built": "YearBuilt",
+    "overall_qual": "OverallQual",
+    "ms_zoning": "MSZoning",
+}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load the model once at startup instead of loading it per request."""
-    if MODEL_PATH.exists():
-        app.state.model = joblib.load(MODEL_PATH)
-        logger.info("Model loaded from %s", MODEL_PATH)
-    else:
-        # Development fallback for running without a pre-built image.
-        # In production, the model artifact is required.
-        logger.warning("Artifact not found - training at startup (dev-only)")
-        app.state.model = train_model()
-
+    try:
+        client = MlflowClient()
+        mv = client.get_model_version_by_alias(MODEL_NAME, MODEL_ALIAS)
+        app.state.model = mlflow.pyfunc.load_model(f"models:/{MODEL_NAME}@{MODEL_ALIAS}")
+        app.state.model_version = str(mv.version)
+        stats_path = mlflow.artifacts.download_artifacts(
+            run_id=mv.run_id, artifact_path="data_stats.json"
+        )
+        app.state.data_stats = json.loads(Path(stats_path).read_text())
+        logger.info(f"Loaded {MODEL_NAME}@{MODEL_ALIAS} -> version={mv.version}")
+    except Exception as exc:
+        logger.critical(f"FAIL-FAST: Could not resolve model {MODEL_NAME}@{MODEL_ALIAS}: {exc}")
+        raise RuntimeError(f"FAIL-FAST: Model alias {MODEL_NAME}@{MODEL_ALIAS} could not be resolved") from exc
     yield
 
-    app.state.model = None
 
-
-app = FastAPI(
-    title="Forecast API",
-    version=MODEL_VERSION,
-    lifespan=lifespan,
-)
+app = FastAPI(title="Forecast API", lifespan=lifespan)
 
 
 @app.get("/health")
-def health():
-    """Health check endpoint used by the orchestrator."""
-    return {
-        "status": "ok",
-        "model_version": MODEL_VERSION,
-    }
+def health(request: Request):
+    return {"status": "ok", "model_version": request.app.state.model_version}
 
 
-@app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
-    """Predict a house sale price from the provided Ames Housing features.
+@app.get("/model/data-stats")
+def model_data_stats(request: Request):
+    return request.app.state.data_stats
 
-    This is a regular synchronous endpoint rather than ``async def``.
-    FastAPI executes synchronous endpoints in a thread pool, preventing
-    CPU-bound inference from blocking the event loop.
-    """
+
+@app.post("/predict", response_model=schemas.PredictResponse)
+def predict(payload: schemas.PredictRequest, request: Request):
     t0 = time.perf_counter()
-
-    # Wire contract -> exact Ames dataset column names.
-    df = pd.DataFrame([{
-        "GrLivArea": req.gr_liv_area,
-        "TotalBsmtSF": req.total_bsmt_sf,
-        "GarageArea": req.garage_area,
-        "YearBuilt": req.year_built,
-        "OverallQual": req.overall_qual,
-        "MSZoning": req.ms_zoning,
-    }])
-
-    price = float(app.state.model.predict(df[NUM + CAT])[0])
+    row = {COLUMN_MAP[k]: v for k, v in payload.model_dump().items()}
+    df = pd.DataFrame([row])
+    pred = round(float(request.app.state.model.predict(df)[0]), 2)
     latency_ms = round((time.perf_counter() - t0) * 1000, 2)
-
-    logger.info(
-        "predict: %.2f USD (%.2f ms)",
-        price,
-        latency_ms,
-    )
-
-    return PredictResponse(
-        predicted_price=price,
-        model_version=MODEL_VERSION,
-        latency_ms=latency_ms,
-    )
+    return {
+        "predicted_price": pred,
+        "currency": "USD",
+        "model_version": request.app.state.model_version,
+        "latency_ms": latency_ms,
+    }

@@ -15,12 +15,57 @@ services:
       timeout: 3s
       retries: 5
 
+  broker:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mlflow:
+    build:
+      context: ./mlflow_service
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        URI=$$(python3 -c "import urllib.parse, pathlib; pw=urllib.parse.quote_plus(pathlib.Path('/run/secrets/db_password').read_text().strip()); print(f'postgresql+psycopg2://orders:{pw}@postgres:5432/mlflow')")
+        exec mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri "$$URI" --serve-artifacts --artifacts-destination /mlartifacts
+    secrets:
+      - db_password
+    volumes:
+      - mlartifacts:/mlartifacts
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  trainer:
+    build:
+      context: .
+      dockerfile: training_service/Dockerfile
+    profiles: ["train"]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_EXPERIMENT_NAME: house-price
+      MODEL_NAME: ${MODEL_NAME:-house-price}
+      MODEL_ALIAS: ${MODEL_ALIAS:-prod}
+    depends_on:
+      - mlflow
+      - postgres
+
   forecast-api:
     build:
       context: .
       dockerfile: forecast-service/Dockerfile
     environment:
-      MODEL_VERSION: ${MODEL_VERSION:-v0.1.0}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME:-house-price}
+      MODEL_ALIAS: ${MODEL_ALIAS:-prod}
+    depends_on:
+      - mlflow
 
   orders-api:
     build:
@@ -31,20 +76,53 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-orders}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
+      REDIS_URL: redis://broker:6379/0
       FORECAST_URL: http://forecast-api:8001/predict
       FORECAST_TIMEOUT: ${FORECAST_TIMEOUT:-3.0}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      BATCH_MAX_ITEMS: ${BATCH_MAX_ITEMS:-50}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME:-house-price}
+      MODEL_ALIAS: ${MODEL_ALIAS:-prod}
+    secrets:
+      - db_password
+      - jwt_secret_key
     ports:
       - "${ORDERS_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+
+  orders-worker:
+    build:
+      context: .
+      dockerfile: orders-service/Dockerfile
+    command: ["python", "-m", "app.worker"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-orders}
+      POSTGRES_DB: ${POSTGRES_DB:-orders}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      REDIS_URL: redis://broker:6379/0
+      FORECAST_URL: http://forecast-api:8001/predict
+      FORECAST_TIMEOUT: ${FORECAST_TIMEOUT:-3.0}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME:-house-price}
+      MODEL_ALIAS: ${MODEL_ALIAS:-prod}
     secrets:
       - db_password
       - jwt_secret_key
     depends_on:
       postgres:
         condition: service_healthy
+      broker:
+        condition: service_healthy
 
 volumes:
   pgdata:
+  mlartifacts:
 
 secrets:
   db_password:

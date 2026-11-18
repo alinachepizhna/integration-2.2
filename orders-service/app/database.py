@@ -7,11 +7,8 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 def read_secret(name: str) -> str:
     secret_path = Path(f"/run/secrets/{name}")
     if not secret_path.is_file():
-        raise RuntimeError(f"FAIL-FAST: Required Docker secret '{name}' not found at {secret_path}")
-    value = secret_path.read_text(encoding="utf-8").strip()
-    if not value:
-        raise RuntimeError(f"FAIL-FAST: Docker secret '{name}' is empty")
-    return value
+        raise RuntimeError(f"FAIL-FAST: Secret '{name}' not found at {secret_path}")
+    return secret_path.read_text(encoding="utf-8").strip()
 
 
 DB_PASSWORD = read_secret("db_password")

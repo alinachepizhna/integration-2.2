@@ -4,7 +4,6 @@ from .database import Base
 
 class User(Base):
     __tablename__ = "users"
-
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(64), unique=True, index=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
@@ -14,7 +13,6 @@ class User(Base):
 
 class Order(Base):
     __tablename__ = "orders"
-
     id = Column(Integer, primary_key=True, index=True)
     client_name = Column(String(120), nullable=False)
     gr_liv_area = Column(Float, nullable=False)
@@ -24,4 +22,6 @@ class Order(Base):
     overall_qual = Column(Integer, nullable=False)
     ms_zoning = Column(String(10), nullable=False)
     predicted_price = Column(Float, nullable=True)
+    status = Column(String(16), nullable=False, default="pending", server_default="pending")
+    model_version = Column(String(32), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

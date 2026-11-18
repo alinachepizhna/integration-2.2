@@ -1,4 +1,4 @@
-Gr Liv Area,Total Bsmt SF,Garage Area,Year Built,Overall Qual,MS Zoning,SalePrice
+GrLivArea,TotalBsmtSF,GarageArea,YearBuilt,OverallQual,MSZoning,SalePrice
 885,1975,358,2004,9,RL,284054.0
 3076,781,847,1912,10,RL,332284.0
 2694,118,136,1939,6,RL,246813.0
