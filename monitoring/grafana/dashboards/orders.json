@@ -1,0 +1,52 @@
+{
+  "title": "Orders Pricing Observability",
+  "uid": "orders-observability",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Orders per second, by terminal status",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(orders_total[1m]))",
+          "legendFormat": "{{status}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Pricing latency, 95th percentile",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(pricing_seconds_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "SLI: share of orders priced within 5 seconds",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 8, "w": 24, "h": 6 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1 }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(pricing_seconds_bucket{le=\"5.0\"}[5m])) / sum(rate(pricing_seconds_count[5m]))",
+          "legendFormat": "SLI (<=5s)",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

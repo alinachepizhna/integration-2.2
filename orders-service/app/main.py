@@ -1,32 +1,94 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+import json
 import os
+import time
 from typing import Annotated, List
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 import httpx
-import redis
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from sqlalchemy.orm import Session
 
 from . import models, schemas
 from .auth import create_access_token, get_current_user, hash_password, verify_password
-from .database import Base, engine, get_db
+from .database import Base, SessionLocal, engine, get_db
 
 Base.metadata.create_all(bind=engine)
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://broker:6379/0")
-QUEUE_NAME = "pricing_queue"
 FORECAST_URL = os.getenv("FORECAST_URL", "http://forecast-api:8001/predict")
 FORECAST_TIMEOUT = float(os.getenv("FORECAST_TIMEOUT", "3.0"))
 BATCH_MAX_ITEMS = int(os.getenv("BATCH_MAX_ITEMS", "50"))
 FEATURE_FIELDS = {"gr_liv_area", "total_bsmt_sf", "garage_area", "year_built", "overall_qual", "ms_zoning"}
 
+ORDERS_TOTAL = Counter("orders_total", "Total orders by terminal pricing status", ["status"])
+PRICING_SECONDS = Histogram(
+    "pricing_seconds",
+    "Wall time of one pricing operation in seconds",
+    buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+)
+ORDERS_TOTAL.labels(status="priced").inc(0)
+ORDERS_TOTAL.labels(status="failed").inc(0)
+
+
+def emit(event: str, level: str = "info", **fields) -> None:
+    record = {"ts": datetime.now(timezone.utc).isoformat(), "level": level, "event": event, **fields}
+    print(json.dumps(record), flush=True)
+
+
+def run_pricing_task(order_id: int) -> None:
+    emit("pricing_started", order_id=order_id)
+    t0 = time.perf_counter()
+    db = SessionLocal()
+    try:
+        order = db.query(models.Order).filter(models.Order.id == order_id).first()
+        if not order:
+            return
+        payload = {
+            "gr_liv_area": order.gr_liv_area,
+            "total_bsmt_sf": order.total_bsmt_sf,
+            "garage_area": order.garage_area,
+            "year_built": order.year_built,
+            "overall_qual": order.overall_qual,
+            "ms_zoning": order.ms_zoning,
+        }
+        last_err = ""
+        for attempt in range(2):
+            try:
+                with httpx.Client(timeout=FORECAST_TIMEOUT) as client:
+                    resp = client.post(FORECAST_URL, json=payload, headers={"X-Order-Id": str(order_id)})
+                    resp.raise_for_status()
+                    data = resp.json()
+                elapsed = time.perf_counter() - t0
+                order.predicted_price = float(data["predicted_price"])
+                order.model_version = str(data["model_version"])
+                order.status = "priced"
+                db.commit()
+                ORDERS_TOTAL.labels(status="priced").inc()
+                PRICING_SECONDS.observe(elapsed)
+                emit("pricing_succeeded", order_id=order_id, duration_ms=round(elapsed * 1000, 1))
+                return
+            except Exception as exc:
+                last_err = str(exc)
+                if attempt == 0:
+                    time.sleep(1.0)
+
+        elapsed = time.perf_counter() - t0
+        order.predicted_price = None
+        order.status = "failed"
+        db.commit()
+        ORDERS_TOTAL.labels(status="failed").inc()
+        PRICING_SECONDS.observe(elapsed)
+        emit("pricing_failed", level="error", order_id=order_id, error=last_err)
+    finally:
+        db.close()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.http_client = httpx.AsyncClient(timeout=FORECAST_TIMEOUT)
-    app.state.redis = redis.from_url(REDIS_URL, decode_responses=True)
     yield
     await app.state.http_client.aclose()
 
@@ -37,6 +99,11 @@ app = FastAPI(title="Orders API", lifespan=lifespan)
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/auth/register", response_model=schemas.UserOut, status_code=status.HTTP_201_CREATED)
@@ -70,7 +137,7 @@ def read_me(current_user: models.User = Depends(get_current_user)):
 @app.post("/orders", response_model=schemas.OrderRead, status_code=status.HTTP_202_ACCEPTED)
 def create_order(
     payload: schemas.OrderCreate,
-    request: Request,
+    background_tasks: BackgroundTasks,
     response: Response,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
@@ -80,7 +147,7 @@ def create_order(
     db.commit()
     db.refresh(order)
     response.headers["Location"] = f"/orders/{order.id}"
-    request.app.state.redis.rpush(QUEUE_NAME, str(order.id))
+    background_tasks.add_task(run_pricing_task, order.id)
     return order
 
 
@@ -111,7 +178,7 @@ async def create_orders_batch(
             "overall_qual": o.overall_qual,
             "ms_zoning": o.ms_zoning,
         }
-        r = await http_client.post(FORECAST_URL, json=payload, timeout=FORECAST_TIMEOUT)
+        r = await http_client.post(FORECAST_URL, json=payload, headers={"X-Order-Id": str(o.id)}, timeout=FORECAST_TIMEOUT)
         r.raise_for_status()
         return r.json()
 
@@ -122,11 +189,13 @@ async def create_orders_batch(
         if isinstance(res, Exception):
             order.status = "failed"
             order.predicted_price = None
+            ORDERS_TOTAL.labels(status="failed").inc()
             results.append(schemas.BatchOrderItemResult(index=idx, order_id=order.id, status="failed", error="ForecastUnavailable"))
         else:
             order.status = "priced"
             order.predicted_price = float(res["predicted_price"])
             order.model_version = str(res["model_version"])
+            ORDERS_TOTAL.labels(status="priced").inc()
             results.append(
                 schemas.BatchOrderItemResult(
                     index=idx,
@@ -162,7 +231,7 @@ def get_order(oid: int, db: Session = Depends(get_db), current_user: models.User
 def update_order(
     oid: int,
     payload: schemas.OrderUpdate,
-    request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
@@ -182,7 +251,7 @@ def update_order(
         order.model_version = None
         db.commit()
         db.refresh(order)
-        request.app.state.redis.rpush(QUEUE_NAME, str(order.id))
+        background_tasks.add_task(run_pricing_task, order.id)
     else:
         db.commit()
         db.refresh(order)
